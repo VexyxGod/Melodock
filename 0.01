@@ -1,1 +1,96 @@
 
+# DEV_LOG — Melodock 0.0.1 (для второго ИИ / разработчика)
+
+Состояние на момент выпуска 0.0.1. Читай сверху вниз: сначала что это, потом что **не проверено на живом Spotify/SoundCloud**, потом статус каждого пункта ТЗ.
+
+## 1. Что это и как устроено
+
+Патчер десктопного клиента Spotify (по принципу Spicetify): в `xpui.spa` (zip с интерфейсом) вставляется `payload/claudefi.js` + удаляется CSP-мета. Внутри Spotify этот скрипт рисует вкладку SoundCloud поверх области контента. Фоновый **помощник** (Node, `127.0.0.1:47321`) делает то, что браузеру Spotify запрещено (CORS, запись, OAuth, Discord IPC, запуск браузера).
+
+```
+Melodock_Setup.bat / _Uninstall.bat / _Helper.bat   запуск; ставят UTF-8, вызывают node bin\melodock.js <apply|restore|serve>
+bin/melodock.js        CLI (apply/restore/status/stop/autostart/devtools/serve/help); bin/claudefi.js — шим для старых автозапусков
+lib/ui.js              оформление консоли (пиксельный логотип MELODOCK, шаги со спиннером), палитра BRAND в начале файла
+lib/patch.js, zip.js   чтение/запись xpui.spa без зависимостей; MARKER "claudefi/claudefi.js" (внутреннее имя НЕ менять)
+lib/spotify.js         поиск xpui.spa на Win/Mac/Linux, Store-версию не патчим
+lib/runtime.js         копия программы в ~/.claudefi/app, автозапуск (VBS/LaunchAgent/.desktop), старт/стоп помощника
+lib/serve.js           HTTP-помощник: /fetch (прокси чтения + запись лайка api-v2), /open, /presence (Discord), /oauth/* (официальный API),
+                       /update/*, /engine/* (аудио-движок), /health (plain text, его парсит runtime.js — формат не менять), /origins
+lib/discord.js         Rich Presence по IPC (named pipe / unix socket), Application ID задаёт пользователь
+lib/official.js        OAuth 2.1 + PKCE для официального API SoundCloud, токены в ~/.claudefi/official.json (0600)
+lib/update.js          проверка GitHub Releases, сравнение semver
+lib/engine.js + player.html   запасной путь звука: окно Edge/Chrome (на Windows скрыто PowerShell-ом), там же нормализатор
+payload/claudefi.js    весь интерфейс и логика внутри Spotify (один IIFE, ~2400 строк)
+tools/bump.js          поднять версию в package.json и MD_VERSION
+RELEASING.md           как выпускать релизы; README.md — для пользователя
+```
+
+Внутренние имена оставлены от прежнего названия Claudefi намеренно (иначе пользователи потеряют токен/настройки): папка `~/.claudefi`, ключи localStorage `claudefi:*`, DOM-id `claudefi-root`, `window.Claudefi`, env `CLAUDEFI_*`, строка `/health` ("claudefi ok …").
+
+### payload: карта
+- `store` (localStorage `claudefi:*`), `api()` — кэш GET (5 мин, поиск 2 мин) + дедупликация; `scGet()` — прямой fetch → при CORS через `/fetch` (токен в заголовке `X-Melodock-Token`).
+- Аудио: `htmlAudio` (обычный `<audio>`) и `gAudio` (только `blob:` — идёт через `createNormalizer`); `audio.playRemote` — режим «аудио-движок». `createNormalizer` скопирован **в двух местах** (payload и lib/player.html) — правки вносить в оба.
+- UI: shadow DOM `#claudefi-root` (панель поверх `.Root__main-view`, модальные окна настроек и «Добавить»), второй shadow DOM `#melodock-nowplaying` (оболочка поверх нижней панели Spotify `#nb` и правой панели «Сейчас играет» `#nr`).
+- Темы: `THEMES` → CSS-переменные на host-элементах (`applyTheme`). Знак (`badge()`) берёт цвета из `--acc/--acc2/--ink`.
+- Состояния: `state` (текущий экран), `viewCache`, `queue/qi`, `hist/hpos` (стек истории), `wave`, `mix`, `likedIds` (SoundCloud) / `localLikes` (только Melodock), `officialOn`.
+
+## 2. НЕ проверено на живом Spotify/SoundCloud (тесты — на макете)
+
+Всё тестировалось в Chromium на макете Spotify (`/home/claude/test/harness*.html` в песочнице, не в архиве) с подменой ответов SoundCloud. Ниже — допущения, которые могут не совпасть с реальностью:
+
+1. **Разметка Spotify** (самое хрупкое): `.Root__main-view`, `.Root__right-sidebar`, `[data-testid=now-playing-bar|now-playing-widget|player-controls|control-button-playpause|control-button-skip-forward|control-button-npv|playback-position|playback-duration|volume-bar|volume-bar-toggle-mute-button|home-button]`, `aria-label` кнопки play/pause (`/paus|пауз/`), `aria-pressed` у NPV. Если у Spotify другая вёрстка — нижняя/правая панель встанет криво, громкость не подхватится, Микс собьётся.
+2. **Роутер Spotify**: ищется React-fiber → `props.history` (`listen`, `location`); у Spicetify берётся `Spicetify.Platform.History`. Запасные: клик по `a[href]/[role=row]` в левой панели, MutationObserver. Это самое вероятное место, где «закрытие при выборе плейлиста» ещё может не сработать.
+3. **Громкость**: ползунок Spotify читается как `input[type=range]` в `[data-testid=volume-bar]`. Положение переводится степенью (`vol_curve`, по умолчанию ×2 = −12 дБ на 50 %) — точной кривой Spotify нет, это оценка; тюнится в настройках.
+4. **SoundCloud**: `api-v2` эндпоинты (`/users/{id}/track_likes`, `/tracks/{id}/related`, `/users/{id}/followings`, `/tracks?ids=`, `/me/track_likes/ids`) взяты из знаний о сайте, не из документации.
+5. **Официальный API** (`lib/official.js`): адреса `secure.soundcloud.com/authorize|oauth/token`, `api.soundcloud.com/likes/tracks/{id}` (POST/DELETE), схема `Authorization: OAuth <token>` — по документации «из головы», не проверены вживую; нужен зарегистрированный пользователем app с redirect `http://127.0.0.1:47321/oauth/callback`.
+6. **Discord**: протокол IPC проверен на поддельном сокете (`helper_test.js`), не на настоящем Discord. Нужен Application ID. Картинка обложки — внешний URL в `large_image` (Discord может её не показать).
+7. **Spicetify**: `new Spicetify.Topbar.Button(label, icon, onClick, disabled, isRight)` — сигнатура по памяти.
+8. **Эксперимент «спасение»** (`rescueScan`): селекторы серых строк `[data-testid=tracklist-row][aria-disabled=true]` — угадано; по умолчанию выключено.
+9. **Скрытие окна аудио-движка на Windows** (PowerShell + `ShowWindow`) — не проверено на Windows.
+
+## 3. Статус пунктов ТЗ
+
+| # | Пункт | Статус | Примечание |
+|---|---|---|---|
+| 1 | Название, порядок, старт «Лайки» | ✅ | Везде «Melodock»; открытие всегда на «Лайки». В списке добавлены «Микс» и «Друзья». |
+| 2 | Громкость | ✅ / ⚠ | Ползунок один — родной Spotify, Melodock ведётся за ним; mute уважается; старт без «оглушения» (предусиление −9 дБ + плавный подъём до замера LUFS). Свой ползунок не добавлялся (п. 3 требует единого источника). Кривая ×2 — оценка, см. §2.3. |
+| 3 | Единый нижний плеер | ✅ / ⚠ | Встроенного плеера нет. Звук SoundCloud нельзя подать в движок Spotify, поэтому левая/центральная часть нижней панели **закрывается** нашей оболочкой с иконкой Melodock; правая (очередь, устройства, громкость) родная. |
+| 4 | Закрытие при выборе плейлиста | ⚠ | Три слоя (роутер/клик/мутации), см. §2.2. На живом Spotify не подтверждено. |
+| 5 | Лайки (обход 403) | ⚠ **обход не делается** | CloudFront/DataDome — защита от ботов; подделка браузера/решение капчи **не реализованы намеренно**. Сделано: официальный API (OAuth, §2.5) → иначе одна честная попытка api-v2 раз в 30 мин → иначе лайк хранится в Melodock + кнопка «Открыть на сайте и лайкнуть вручную». |
+| 6 | Микс | ✅ / ⚠ | Fisher–Yates (crypto + rejection sampling), круг без повторов, только лайки SoundCloud + Melodock; стек истории `hist/hpos` для Назад/Вперёд (общий для всех режимов). **Лайки Spotify недоступны** (нет доступа к его API) — Spotify вступает своей очередью (лучше «Любимые треки»). |
+| 7 | Скорость | ✅ | Кэш API + дедупликация, предзагрузка обложки и ссылки на поток следующего трека, `loading=lazy`/`decoding=async`. Метаданные между сессиями не кэшируются (токены потоков протухают). |
+| 8 | Spicetify | ✅ / ⚠ | Есть `Topbar.Button` и история роутера из `Spicetify.Platform.History`; без Spicetify — прежняя кнопка рядом с «Главной». |
+| 9 | Безопасность | ✅ | Токены только в localStorage Spotify и на диске помощника (0600); токен в заголовке, не в URL; внешние строки — только `textContent`; URL картинок/ссылок проверяются (`safeImg`, `safeSc`, белый список в помощнике); статический аудит адресов — §4; телеметрии нет. Остаётся: CORS помощника открыт для любого Origin (см. §5). |
+| 10 | Единый поиск Spotify+SC | ❌ частично | Доступа к Spotify API нет → результаты Spotify получить нельзя. Сделано: SoundCloud-результаты со значком источника + кнопка «Искать … в Spotify» (открывает родной поиск). |
+| 11 | «Спасение» серых треков | ⚠ эксперимент | Выключено по умолчанию, ⚙ → Эксперименты. Селекторы не проверены. |
+| 12 | Окно «Добавить в плейлист» | ⚠ | Окно со switch Spotify/Melodock есть, но **Spotify-вкладка отключена** (нельзя добавлять в чужие плейлисты без API). Плейлисты Melodock — локальные, показываются первыми в «Плейлистах». Удаления/переименования плейлистов нет. |
+| 13 | Интеграция в родной поиск Spotify | ❌ | Не сделано: инъекция в вёрстку Spotify без возможности проверки слишком рискованна. |
+| 14 | Discord Rich Presence | ⚠ | Реализовано (название, исполнитель, обложка, тайм-код), см. §2.6. |
+| 15 | Друзья | ⚠ частично | «Друзья» = подписки SoundCloud: их недавние лайки («что добавляют») и публичные плейлисты. Активность друзей Spotify недоступна. |
+| 16 | Баг прокрутки | ✅ | Панель `position: fixed`, высота ограничена `min(…, innerHeight − top)`, `max-height: 100vh`. |
+| 17 | Фирменный стиль | ✅ | «Лайк» и «Добавить» — кольцо с буквой M; лайкнуто — залитый значок темы. Знак «Orbit M» следует цвету темы. |
+| 18 | Темы | ✅ | «Тёмная» строго нейтральная; «Бирюза» — отдельная; ещё Закат, Неон, Лес, Океан; плюс Светлая и Системная. «Графит» удалён (старое значение мигрирует в «Тёмную»). |
+| 19 | Редизайн Поиска/Волны | ✅ | Пустое состояние поиска, жанры в выпадающем списке, статус-бар «Сейчас: Phonk • Только редкое». |
+| 20 | Drag-and-drop вкладок | ✅ | HTML5 DnD, порядок в `claudefi:tabs_order`. |
+| 21 | Релиз 0.0.1, обновления, документация | ✅ | `RELEASING.md`, `tools/bump.js`, проверка GitHub Releases + баннер; автообновление = уведомление + установка в один клик (тихая подмена кода намеренно не делается). Нужно указать репозиторий в `package.json` (`melodock.repo`). |
+
+## 4. Аудит сети и безопасности (статический)
+
+Внешние адреса в коде: `127.0.0.1` (помощник), `soundcloud.com`, `api-v2.soundcloud.com`, `a-v2.sndcdn.com` (поиск client_id), `api.soundcloud.com` и `secure.soundcloud.com` (только официальный OAuth по желанию пользователя), `api.github.com` / `github.com` (опциональная проверка релизов, отключается). Нет: WebSocket, sendBeacon, XHR, аналитики, динамических `<script>`, `eval`. `innerHTML` используется только с константами (иконки). Команда для повторной проверки:
+
+```bash
+grep -ohE "https?://[A-Za-z0-9._-]+" payload/claudefi.js lib/*.js lib/player.html bin/*.js | sort | uniq -c
+```
+
+## 5. Известные риски / что делать дальше
+
+1. **Проверить на живом Spotify** пункты §2 по порядку 1→2→3; запустить `GET http://127.0.0.1:47321/origins` после работы вкладки — там будет реальный `Origin` клиента Spotify. Затем ужесточить CORS в `lib/serve.js` (`cors()` + `sensitive()`): сейчас любой сайт в браузере пользователя может обращаться к `127.0.0.1:47321` (защита — белые списки хостов, заголовок `X-Melodock` для опасных POST и проверка `Host`, но не Origin).
+2. Если закрытие по клику на плейлист не работает — открыть DevTools Spotify (`node bin/melodock.js devtools`, Ctrl+Shift+I), выяснить реальные селекторы левой панели и объект истории (`window.Spicetify`-аналог), поправить `findRouterHistory`, `SIDEBAR_SEL`, `NAV_HIT`.
+3. Лайки: если появится возможность проверить официальный API — убедиться в адресах/заголовках `lib/official.js`. Не добавлять подделку браузера для api-v2.
+4. Spotify-часть Микса держится на таймере и кнопках нативной панели (`mixTick`, `mixBackToSc`); при сбое проверять `playback-position/duration` и `control-button-skip-forward`.
+5. Дублирование нормализатора (payload ↔ player.html) — вынести в общий файл, который помощник отдаёт и вставляет при патче.
+6. Не сделано: п. 13; Spotify-половина п. 10/12; активность друзей Spotify; удаление плейлистов Melodock; кэш метаданных между сессиями.
+
+## 6. Тесты (в песочнице, не в архиве)
+
+Playwright + Chromium на макете Spotify; на момент выпуска: `shot5` (54 проверки: темы/контраст, громкость, закрытие по плейлисту, лайки, Микс), `shot6` (6: нижняя/правая панель), `shot7` (38: вкладки DnD, поиск, волна, история, друзья, плейлисты, официальный API, капча→ручная кнопка, XSS, обновления, Discord, старт без «оглушения»), `helper_test.js` (11: Discord-сокет, PKCE, semver). Все зелёные. Команды: `node --check` для `lib/*.js bin/*.js payload/*.js`; патчер проверяется сборкой тестового `xpui.spa` и `zipfile.testzip()`.
